@@ -191,7 +191,8 @@ typedef struct {
 
 static int get_package_options(PackageOption *options, int max_options) {
     int count = 0;
-    FAT32_FileInfo entries[32];
+    FAT32_FileInfo *entries = (FAT32_FileInfo *)malloc(sizeof(FAT32_FileInfo) * 32);
+    if (!entries) return 0;
     int offset = 0;
     while (count < max_options) {
         int n = sys_list_offset("/usr/share/packages", entries, 32, offset);
@@ -210,6 +211,7 @@ static int get_package_options(PackageOption *options, int max_options) {
         }
         offset += n;
     }
+    free(entries);
     return count;
 }
 
@@ -546,6 +548,59 @@ static int show_confirmation(const char *diskname) {
     }
 }
 
+static int show_developer_warning(void) {
+    int w = 66;
+    int h = 17;
+    int selected = 1; /* default to "No" */
+
+    update_term_size();
+    clear_screen_blue();
+    int last_cols = term_cols;
+    int last_rows = term_rows;
+
+    while (1) {
+        update_term_size();
+        if (term_cols != last_cols || term_rows != last_rows) {
+            clear_screen_blue();
+            last_cols = term_cols;
+            last_rows = term_rows;
+        }
+
+        int x = (term_cols - w) / 2;
+        int y = (term_rows - h) / 2;
+
+        draw_box(x, y, w, h, "Developer Warning");
+
+        write_str(x + 4, y + 2,  "! This is a DEVELOPER BETA build of BoredOS.",        BG_WHITE FG_RED);
+        write_str(x + 4, y + 3,  "  It will very likely always remain a beta release.", BG_WHITE FG_BLACK);
+
+        write_str(x + 4, y + 5,  "! THIS SOFTWARE IS UNSTABLE.",                        BG_WHITE FG_RED);
+        write_str(x + 4, y + 6,  "  It may corrupt data, destroy partitions, fail to",  BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 7,  "  boot, or damage your system in unexpected ways.",    BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 8,  "  The BoredOS developers are NOT responsible for",    BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 9,  "  any damage or data loss caused by this software.",  BG_WHITE FG_BLACK);
+
+        write_str(x + 4, y + 11, "! THIS OS REQUIRES COMMAND-LINE KNOWLEDGE.",          BG_WHITE FG_RED);
+        write_str(x + 4, y + 12, "  If you have never used a shell, terminal, or CLI,", BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 13, "  please press < No > and do not proceed.",           BG_WHITE FG_BLACK);
+
+        if (selected == 0) {
+            write_str(x + 10, y + h - 2, "< I understand, continue >", BG_RED FG_WHITE);
+            write_str(x + 40, y + h - 2, "<  No, go back  >",          BG_WHITE FG_BLACK);
+        } else {
+            write_str(x + 10, y + h - 2, "< I understand, continue >", BG_WHITE FG_BLACK);
+            write_str(x + 40, y + h - 2, "<  No, go back  >",          BG_RED FG_WHITE);
+        }
+
+        int k = get_key();
+        if (k == KEY_LEFT || k == KEY_RIGHT || k == '\t') {
+            selected = !selected;
+        } else if (k == KEY_ENTER) {
+            return (selected == 0);
+        }
+    }
+}
+
 static void show_message(const char *title, const char *msg1, const char *msg2) {
     update_term_size();
     clear_screen_blue();
@@ -603,6 +658,11 @@ int main(int argc, char **argv) {
         sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
         return 0;
     }
+
+    if (!show_developer_warning()) {
+        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        return 0;
+    }    
     
     update_term_size();
     clear_screen_blue();
