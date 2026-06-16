@@ -11,6 +11,10 @@
 #include <sys/ioctl.h>
 
 #define TIOCGWINSZ 0x5413
+
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
 struct winsize {
     unsigned short ws_row;
     unsigned short ws_col;
@@ -91,8 +95,16 @@ static int get_key(void) {
     }
 }
 
+static void clear_screen(void) {
+    if (write(STDOUT_FILENO, "\x1b[2J", 4) != 4 ||
+        write(STDOUT_FILENO, "\x1b[H", 3) != 3) {
+        perror("write");
+    }
+}
+
 static void clear_screen_blue(void) {
-    sys_write(1, "\x1b[44m\x1b[97m\x1b[2J\x1b[H", 18);
+    sys_write(1, "\x1b[44m\x1b[97m", 10);
+    clear_screen();
     for (int r = 0; r < term_rows; r++) {
         char pos[32];
         int len = snprintf(pos, sizeof(pos), "\x1b[%d;1H", r + 1);
@@ -250,6 +262,10 @@ static void load_excludes(void) {
 }
 
 static int should_exclude(const char *path) {
+    if (sc_strcmp(path, "/bin/boredos_install") == 0 ||
+        sc_strcmp(path, "/bin/boredos_install.elf") == 0) {
+        return 1;
+    }
     for (int i = 0; i < num_excludes; i++) {
         if (sc_strcmp(path, excludes[i]) == 0) {
             return 1;
@@ -638,7 +654,8 @@ int main(int argc, char **argv) {
     int num_disks = get_available_disks(disks, 16);
     if (num_disks == 0) {
         show_message("Error", "No hard disks detected on this computer.", "Cannot install BoredOS. Exiting.");
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     
@@ -655,12 +672,14 @@ int main(int argc, char **argv) {
     }
     
     if (!show_confirmation(devname)) {
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 0;
     }
 
     if (!show_developer_warning()) {
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 0;
     }    
     
@@ -699,14 +718,16 @@ int main(int argc, char **argv) {
     int pid = sys_spawn("/bin/fdisk.elf", fdisk_args, 0, 0);
     if (pid < 0) {
         show_message("Error", "Failed to partition the target disk.", "fdisk spawn failed.");
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     int status = 0;
     waitpid(pid, &status, 0);
     if (status != 0) {
         show_message("Error", "fdisk failed to partition the disk.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     sys_disk_rescan(devname);
@@ -733,7 +754,8 @@ int main(int argc, char **argv) {
     
     if (!root_dev[0] || (is_uefi && !esp_dev[0])) {
         show_message("Error", "Could not locate target partitions after partitioning.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     
@@ -741,13 +763,15 @@ int main(int argc, char **argv) {
     if (is_uefi) {
         if (sys_disk_mkfs_fat32(esp_dev, "EFI") != 0) {
             show_message("Error", "Failed to format the ESP partition.", NULL);
-            sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+            sys_write(1, "\x1b[?25h\x1b[0m", 10);
+            clear_screen();
             return 1;
         }
     }
     if (sys_disk_mkfs_fat32(root_dev, "BOREDOS") != 0) {
         show_message("Error", "Failed to format the root partition.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     
@@ -757,14 +781,16 @@ int main(int argc, char **argv) {
     
     if (sys_disk_mount(root_dev, "/mnt") != 0) {
         show_message("Error", "Failed to mount root partition to /mnt.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     if (is_uefi) {
         sys_mkdir("/mnt/boot");
         if (sys_disk_mount(esp_dev, "/mnt/boot") != 0) {
             show_message("Error", "Failed to mount ESP partition to /mnt/boot.", NULL);
-            sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+            sys_write(1, "\x1b[?25h\x1b[0m", 10);
+            clear_screen();
             return 1;
         }
     } else {
@@ -779,14 +805,16 @@ int main(int argc, char **argv) {
     show_progress("Copying system binaries (/bin)...", 30);
     if (copy_tree("/bin", "/mnt/bin") != 0) {
         show_message("Error", "Failed to copy essential binaries to target.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     
     show_progress("Copying system libraries (/Library)...", 45);
     if (copy_tree("/Library", "/mnt/Library") != 0) {
         show_message("Error", "Failed to copy /Library contents.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     
@@ -798,7 +826,8 @@ int main(int argc, char **argv) {
     
     if (copy_file("/boot/boredos.elf", "/mnt/boot/boredos.elf") != 0) {
         show_message("Error", "Failed to copy kernel to target boot.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+        sys_write(1, "\x1b[?25h\x1b[0m", 10);
+        clear_screen();
         return 1;
     }
     copy_file_optional("/README.md", "/mnt/README.md");
@@ -884,7 +913,8 @@ int main(int argc, char **argv) {
     show_progress("Installation complete!", 100);
     usleep(500000);
     
-    sys_write(1, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H", 15);
+    sys_write(1, "\x1b[?25h\x1b[0m", 10);
+    clear_screen();
     
     char ok_msg[128];
     snprintf(ok_msg, sizeof(ok_msg), "BoredOS has been successfully installed on /dev/%s.", root_dev);
