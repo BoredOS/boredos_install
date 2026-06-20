@@ -262,8 +262,9 @@ static void load_excludes(void) {
 }
 
 static int should_exclude(const char *path) {
-    if (sc_strcmp(path, "/bin/boredos_install") == 0 ||
-        sc_strcmp(path, "/bin/boredos_install.elf") == 0) {
+    if (sc_strcmp(path, "/bin/boredos_install.elf") == 0 ||
+        sc_strcmp(path, "/bin/installer.elf") == 0 ||
+        sc_strcmp(path, "/usr/share/applications/installer.desktop") == 0) {
         return 1;
     }
     for (int i = 0; i < num_excludes; i++) {
