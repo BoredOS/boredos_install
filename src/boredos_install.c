@@ -798,11 +798,7 @@ int main(int argc, char **argv) {
         sys_mkdir("/mnt/boot");
     }
     
-    if (sys_mkdir("/mnt/Library") == 0 || sys_exists("/mnt/Library")) {
-        int mfd = sys_open("/mnt/Library/.boredos_root", "w");
-        if (mfd >= 0) sys_close(mfd);
-    }
-    
+
     show_progress("Copying system binaries (/bin)...", 30);
     if (copy_tree("/bin", "/mnt/bin") != 0) {
         show_message("Error", "Failed to copy essential binaries to target.", NULL);
@@ -831,9 +827,6 @@ int main(int argc, char **argv) {
         clear_screen();
         return 1;
     }
-    copy_file_optional("/README.md", "/mnt/README.md");
-    copy_file_optional("/LICENSE", "/mnt/LICENSE");
-    copy_file_optional("/about.c", "/mnt/about.c");
     
     int num_selected = 0;
     for (int i = 0; i < num_options; i++) {
