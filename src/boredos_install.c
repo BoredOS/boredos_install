@@ -914,6 +914,6 @@ int main(int argc, char **argv) {
     snprintf(ok_msg, sizeof(ok_msg), "BoredOS has been successfully installed on /dev/%s.", root_dev);
     show_message("Installation Successful", ok_msg, "Press Enter to reboot and start BoredOS!");
     
-    sys_system(12 /* SYSTEM_CMD_REBOOT */, 0, 0, 0, 0);
+    sys_reboot();
     return 0;
 }
