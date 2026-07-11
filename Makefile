@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Christiaan (chris@boreddev.nl)
 # BoredOS Installer Standalone Makefile
 
-CC = x86_64-elf-gcc
-LD = x86_64-elf-ld
+CC = x86_64-boredos-gcc
+LD = x86_64-boredos-ld
 
 ifneq ($(BOREDOS_SDK),)
   ifeq ($(wildcard $(BOREDOS_SDK)/lib/libc.a),)
