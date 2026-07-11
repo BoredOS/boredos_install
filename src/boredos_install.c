@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 #define TIOCGWINSZ 0x5413
 
