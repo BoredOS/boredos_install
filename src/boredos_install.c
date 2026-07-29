@@ -71,14 +71,14 @@ static int get_key(void) {
     while (1) {
         struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
         poll(&pfd, 1, -1);
-        if (sys_tty_read_in(&ch, 1) <= 0) continue;
+        if (read(0, &ch, 1) <= 0) continue;
         
         if (ch == '\x1b') {
             char seq[2];
             usleep(10000); 
-            int r = sys_tty_read_in(&seq[0], 1);
+            int r = read(0, &seq[0], 1);
             if (r > 0 && seq[0] == '[') {
-                r = sys_tty_read_in(&seq[1], 1);
+                r = read(0, &seq[1], 1);
                 if (r > 0) {
                     switch (seq[1]) {
                         case 'A': return KEY_UP;
