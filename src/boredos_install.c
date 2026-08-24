@@ -11,8 +11,10 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define TIOCGWINSZ 0x5413
+#define TIOCSPGRP  0x5410
 
 #ifndef STDOUT_FILENO
 #define STDOUT_FILENO 1
@@ -47,13 +49,20 @@ static int sc_strncpy(char *dst, const char *src, int n) {
 #define BG_BLACK     "\x1b[40m"
 #define BG_RED       "\x1b[41m"
 #define RESET        "\x1b[0m"
-#define KEY_UP    1000
-#define KEY_DOWN  1001
-#define KEY_LEFT  1002
-#define KEY_RIGHT 1003
-#define KEY_ENTER 1004
-#define KEY_SPACE 1005
-#define KEY_ESC   1006
+#define KEY_UP     1000
+#define KEY_DOWN   1001
+#define KEY_LEFT   1002
+#define KEY_RIGHT  1003
+#define KEY_ENTER  1004
+#define KEY_SPACE  1005
+#define KEY_ESC    1006
+#define KEY_RESIZE 1007
+
+static volatile sig_atomic_t g_installer_winch = 0;
+static void handle_installer_sigwinch(int sig) {
+    (void)sig;
+    g_installer_winch = 1;
+}
 
 static int term_cols = 80;
 static int term_rows = 25;
@@ -69,8 +78,21 @@ static void update_term_size(void) {
 static int get_key(void) {
     char ch;
     while (1) {
+        if (g_installer_winch) {
+            g_installer_winch = 0;
+            update_term_size();
+            return KEY_RESIZE;
+        }
+
         struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
         poll(&pfd, 1, -1);
+
+        if (g_installer_winch) {
+            g_installer_winch = 0;
+            update_term_size();
+            return KEY_RESIZE;
+        }
+        
         if (read(0, &ch, 1) <= 0) continue;
         
         if (ch == '\x1b') {
@@ -229,21 +251,21 @@ static int get_package_options(PackageOption *options, int max_options) {
     return count;
 }
 
-static char excludes[512][128];
+static char excludes[2048][128];
 static int num_excludes = 0;
 
 static void load_excludes(void) {
     int fd = sys_open("/usr/share/packages/excludes.txt", "r");
     if (fd < 0) return;
     
-    char *buf = (char*)malloc(32768);
+    char *buf = (char*)malloc(65536);
     if (!buf) { sys_close(fd); return; }
     
-    int n = sys_read(fd, buf, 32768 - 1);
+    int n = sys_read(fd, buf, 65536 - 1);
     if (n > 0) {
         buf[n] = '\0';
         char *line = buf;
-        while (line && *line && num_excludes < 512) {
+        while (line && *line && num_excludes < 2048) {
             char *next = strchr(line, '\n');
             if (next) *next = '\0';
             
@@ -264,9 +286,12 @@ static void load_excludes(void) {
 }
 
 static int should_exclude(const char *path) {
-    if (sc_strcmp(path, "/bin/boredos_install.elf") == 0 ||
+    if (sc_strcmp(path, "/bin/boredos_install") == 0 ||
+        sc_strcmp(path, "/bin/boredos_install.elf") == 0 ||
+        sc_strcmp(path, "/bin/installer") == 0 ||
         sc_strcmp(path, "/bin/installer.elf") == 0 ||
-        sc_strcmp(path, "/usr/share/applications/installer.desktop") == 0) {
+        sc_strcmp(path, "/usr/share/applications/installer.desktop") == 0 ||
+        strncmp(path, "/usr/share/packages", 19) == 0) {
         return 1;
     }
     for (int i = 0; i < num_excludes; i++) {
@@ -281,21 +306,45 @@ static int should_exclude(const char *path) {
     return 0;
 }
 
+static int g_current_percent = 0;
+static const char *g_current_stage = "";
+static char g_copy_err[128] = "";
+
+static void show_progress(const char *stage_name, int percent);
+
 static int copy_file(const char *src, const char *dst) {
+    show_progress(g_current_stage, g_current_percent);
     int sfd = sys_open(src, "r");
-    if (sfd < 0) return -1;
+    if (sfd < 0) {
+        snprintf(g_copy_err, sizeof(g_copy_err), "cannot open src: %s", src);
+        return -1;
+    }
     sys_delete(dst);
     int dfd = sys_open(dst, "w");
-    if (dfd < 0) { sys_close(sfd); return -1; }
+    if (dfd < 0) {
+        snprintf(g_copy_err, sizeof(g_copy_err), "cannot open dst: %s", dst);
+        sys_close(sfd);
+        return -1;
+    }
 
     char *buf = (char*)malloc(65536);
-    if (!buf) { sys_close(sfd); sys_close(dfd); return -1; }
+    if (!buf) {
+        snprintf(g_copy_err, sizeof(g_copy_err), "malloc failed");
+        sys_close(sfd); sys_close(dfd);
+        return -1;
+    }
     int n;
     while ((n = sys_read(sfd, buf, 65536)) > 0) {
-        if (sys_write_fs(dfd, buf, n) != (uint32_t)n) {
-            sys_close(sfd); sys_close(dfd);
-            free(buf);
-            return -1;
+        int written = 0;
+        while (written < n) {
+            int w = sys_write_fs(dfd, buf + written, n - written);
+            if (w <= 0) {
+                snprintf(g_copy_err, sizeof(g_copy_err), "write failed w=%d n=%d", w, n - written);
+                sys_close(sfd); sys_close(dfd);
+                free(buf);
+                return -1;
+            }
+            written += w;
         }
     }
     free(buf);
@@ -348,8 +397,17 @@ static int copy_tree(const char *src_dir, const char *dst_dir) {
     return 0;
 }
 
-// Progress screen drawing helper
+static int s_last_percent = -1;
+static const char *s_last_stage = NULL;
+
 static void show_progress(const char *stage_name, int percent) {
+    g_current_stage = stage_name;
+    g_current_percent = percent;
+    if (s_last_percent == percent && s_last_stage == stage_name) return;
+    s_last_percent = percent;
+    s_last_stage = stage_name;
+
+    update_term_size();
     int w = 60;
     int h = 8;
     int x = (term_cols - w) / 2;
@@ -522,6 +580,49 @@ static void show_package_selection(PackageOption *options, int num_options) {
     }
 }
 
+static int show_fs_selection(void) {
+    int w = 55;
+    int h = 10;
+    int selected = 0;
+    
+    update_term_size();
+    clear_screen_blue();
+    int last_cols = term_cols;
+    int last_rows = term_rows;
+    
+    while (1) {
+        update_term_size();
+        if (term_cols != last_cols || term_rows != last_rows) {
+            clear_screen_blue();
+            last_cols = term_cols;
+            last_rows = term_rows;
+        }
+        
+        int x = (term_cols - w) / 2;
+        int y = (term_rows - h) / 2;
+        
+        draw_box(x, y, w, h, "Root Filesystem");
+        write_str(x + 4, y + 2, "Choose filesystem for root partition:", BG_WHITE FG_BLACK);
+        
+        if (selected == 0) {
+            write_str(x + 6, y + 4, "[*] EXT4  (Recommended!)", BG_BLACK FG_WHITE);
+            write_str(x + 6, y + 5, "[ ] FAT32", BG_WHITE FG_BLACK);
+        } else {
+            write_str(x + 6, y + 4, "[ ] EXT4 (Recommended!)", BG_WHITE FG_BLACK);
+            write_str(x + 6, y + 5, "[*] FAT32", BG_BLACK FG_WHITE);
+        }
+        
+        write_str(x + (w - 14) / 2, y + h - 2, "< Continue >", BG_RED FG_WHITE);
+        
+        int k = get_key();
+        if (k == KEY_UP || k == KEY_DOWN) {
+            selected = !selected;
+        } else if (k == KEY_ENTER || k == ' ') {
+            return selected;
+        }
+    }
+}
+
 static int show_confirmation(const char *diskname) {
     int w = 60;
     int h = 10;
@@ -649,6 +750,10 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     
+    int fg = getpid();
+    ioctl(0, TIOCSPGRP, &fg);
+    signal(SIGWINCH, handle_installer_sigwinch);
+
     sys_write(1, "\x1b[?25l", 6); 
     update_term_size();
     load_excludes();
@@ -673,6 +778,8 @@ int main(int argc, char **argv) {
     if (num_options > 0) {
         show_package_selection(options, num_options);
     }
+
+    int fs_choice = show_fs_selection();
     
     if (!show_confirmation(devname)) {
         sys_write(1, "\x1b[?25h\x1b[0m", 10);
@@ -738,16 +845,16 @@ int main(int argc, char **argv) {
     char esp_dev[16]  = {0};
     char root_dev[16] = {0};
     
+    const char *raw_devname = devname;
+    if (strncmp(raw_devname, "/dev/", 5) == 0) raw_devname += 5;
+    size_t dev_len = strlen(raw_devname);
+
     int n = sys_disk_get_count();
     for (int i = 0; i < n; i++) {
         disk_info_t d;
         if (sys_disk_get_info(i, &d) != 0) continue;
         if (!d.is_partition) continue;
-        int match = 1;
-        for (int j = 0; devname[j]; j++) {
-            if (d.devname[j] != devname[j]) { match = 0; break; }
-        }
-        if (!match) continue;
+        if (strncmp(d.devname, raw_devname, dev_len) != 0) continue;
         if (is_uefi && d.is_esp && !esp_dev[0])
             sc_strncpy(esp_dev, d.devname, 16);
         else if (!d.is_esp && !root_dev[0]) {
@@ -764,19 +871,55 @@ int main(int argc, char **argv) {
     
     show_progress("Formatting partitions...", 15);
     if (is_uefi) {
-        if (sys_disk_mkfs_fat32(esp_dev, "EFI") != 0) {
-            show_message("Error", "Failed to format the ESP partition.", NULL);
+        char fat_args[64];
+        snprintf(fat_args, sizeof(fat_args), "-F 32 -n EFI /dev/%s", esp_dev);
+        int mpid = sys_spawn("/bin/mkfs_fat.elf", fat_args, 0, 0);
+        if (mpid >= 0) {
+            int status = 0;
+            waitpid(mpid, &status, 0);
+            if (status != 0) {
+                show_message("Error", "Failed to format ESP partition.", NULL);
+                sys_write(1, "\x1b[?25h\x1b[0m", 10);
+                clear_screen();
+                return 1;
+            }
+        }
+    }
+
+    char root_fs_args[64];
+    const char *mkfs_prog = (fs_choice == 0) ? "/bin/mkfs_ext4.elf" : "/bin/mkfs_fat.elf";
+    if (fs_choice == 0) {
+        snprintf(root_fs_args, sizeof(root_fs_args), "-L BOREDOS /dev/%s", root_dev);
+    } else {
+        snprintf(root_fs_args, sizeof(root_fs_args), "-F 32 -n BOREDOS /dev/%s", root_dev);
+    }
+
+    int rpid = sys_spawn(mkfs_prog, root_fs_args, 0, 0);
+    if (rpid >= 0) {
+        int status = 0;
+        waitpid(rpid, &status, 0);
+        if (status != 0) {
+            int code = (status >> 8) ? (status >> 8) : status;
+            char err_detail[128];
+            char log_buf[128] = {0};
+            int lfd = open("/tmp/mkfs_ext4.log", O_RDONLY);
+            if (lfd >= 0) {
+                read(lfd, log_buf, sizeof(log_buf) - 1);
+                close(lfd);
+            }
+            if (log_buf[0]) {
+                snprintf(err_detail, sizeof(err_detail), "%s failed (code %d): %s", mkfs_prog, code, log_buf);
+            } else {
+                snprintf(err_detail, sizeof(err_detail), "%s failed (status %d, code %d)", mkfs_prog, status, code);
+            }
+            show_message("Error", "Failed to format root partition.", err_detail);
             sys_write(1, "\x1b[?25h\x1b[0m", 10);
             clear_screen();
             return 1;
         }
     }
-    if (sys_disk_mkfs_fat32(root_dev, "BOREDOS") != 0) {
-        show_message("Error", "Failed to format the root partition.", NULL);
-        sys_write(1, "\x1b[?25h\x1b[0m", 10);
-        clear_screen();
-        return 1;
-    }
+
+    sys_disk_rescan(devname);
     
     sys_mkdir("/mnt");
     sys_mkdir("/mnt/boot");
@@ -822,9 +965,17 @@ int main(int argc, char **argv) {
     copy_tree("/root", "/mnt/root");
     copy_tree("/usr", "/mnt/usr");
     copy_tree("/etc", "/mnt/etc");
+    sys_mkdir("/mnt/tmp");
+    sys_mkdir("/mnt/var");
+    sys_mkdir("/mnt/var/run");
+    sys_mkdir("/mnt/dev");
+    sys_mkdir("/mnt/proc");
+    sys_mkdir("/mnt/sys");
     
     if (copy_file("/boot/boredos.elf", "/mnt/boot/boredos.elf") != 0) {
-        show_message("Error", "Failed to copy kernel to target boot.", NULL);
+        char err[128];
+        snprintf(err, sizeof(err), "copy failed: %s", g_copy_err);
+        show_message("Error", "Failed to copy kernel to target boot.", err);
         sys_write(1, "\x1b[?25h\x1b[0m", 10);
         clear_screen();
         return 1;
@@ -861,37 +1012,67 @@ int main(int argc, char **argv) {
         sys_mkdir("/mnt/boot/EFI/BOOT");
         copy_file("/boot/BOOTX64.EFI", "/mnt/boot/EFI/BOOT/BOOTX64.EFI");
         copy_file_optional("/boot/BOOTIA32.EFI", "/mnt/boot/EFI/BOOT/BOOTIA32.EFI");
+        copy_file_optional("/boot/splash.jpg", "/mnt/boot/splash.jpg");
         
         int fd = sys_open("/mnt/boot/limine.conf", "w");
         if (fd >= 0) {
-            char cfg[512];
+            char cfg[1024];
             int len = snprintf(cfg, sizeof(cfg),
                 "timeout: 3\n"
                 "verbose: yes\n"
                 "\n"
+                "${WALLPAPER_PATH}=boot():/splash.jpg\n"
+                "\n"
+                "wallpaper: ${WALLPAPER_PATH}\n"
+                "wallpaper_style: stretched\n"
+                "backdrop: 000000\n"
+                "term_margin: 200\n"
+                "interface_branding: BoredOS\n"
+                "\n"
                 "/BoredOS\n"
                 "    protocol: limine\n"
                 "    path: boot():/boredos.elf\n"
-                "    cmdline: -v root=/dev/%s --disk\n",
-                root_dev);
+                "    cmdline: -v root=/dev/%s\n"
+                "\n"
+                "/  └──> BoredOS (Silent)\n"
+                "    protocol: limine\n"
+                "    path: boot():/boredos.elf\n"
+                "    cmdline: root=/dev/%s\n",
+                root_dev, root_dev);
             if (len > 0) sys_write_fs(fd, cfg, len);
             sys_close(fd);
         }
     } else {
         copy_file_optional("/boot/limine-bios.sys", "/mnt/limine-bios.sys");
+        copy_file_optional("/boot/splash.jpg", "/mnt/splash.jpg");
+        copy_file_optional("/boot/splash.jpg", "/mnt/boot/splash.jpg");
         int fd = sys_open("/mnt/limine.conf", "w");
         if (fd >= 0) {
-            char cfg[512];
+            char cfg[1024];
             int len = snprintf(cfg, sizeof(cfg),
                 "timeout: 3\n"
                 "verbose: yes\n"
+                "\n"
+                "${WALLPAPER_PATH}=boot():/splash.jpg\n"
+                "\n"
+                "wallpaper: ${WALLPAPER_PATH}\n"
+                "wallpaper_style: stretched\n"
+                "backdrop: 000000\n"
+                "term_margin: 200\n"
+                "interface_branding: BoredOS\n"
                 "\n"
                 "/BoredOS\n"
                 "    protocol: limine\n"
                 "    root: boot()\n"
                 "    path: /boredos.elf\n"
-                "    cmdline: -v root=/dev/%s --disk\n",
-                root_dev);
+                "    cmdline: -v root=/dev/%s\n"
+                "\n"
+                "/  └──> BoredOS (Silent)\n"
+                "    protocol: limine\n"
+                "    root: boot()\n"
+                "    path: /boredos.elf\n"
+                "    cmdline: root=/dev/%s\n",
+                root_dev, root_dev);
             if (len > 0) sys_write_fs(fd, cfg, len);
             sys_close(fd);
         }
