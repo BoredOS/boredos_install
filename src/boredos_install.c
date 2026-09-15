@@ -13,6 +13,9 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <dirent.h>
+#include <time.h>
+#include <sys/stat.h>
+#include "libcrypt_sha512.h"
 
 #define TIOCGWINSZ 0x5413
 #define TIOCSPGRP  0x5410
@@ -60,6 +63,7 @@ static int sc_strncpy(char *dst, const char *src, int n) {
 #define KEY_RESIZE 1007
 
 static volatile sig_atomic_t g_installer_winch = 0;
+static void show_message(const char *title, const char *msg1, const char *msg2);
 static void handle_installer_sigwinch(int sig) {
     (void)sig;
     g_installer_winch = 1;
@@ -404,6 +408,12 @@ static int copy_file(const char *src, const char *dst) {
     free(buf);
     sys_close(sfd);
     sys_close(dfd);
+
+    struct stat st;
+    if (stat(src, &st) == 0) {
+        chmod(dst, st.st_mode);
+        chown(dst, st.st_uid, st.st_gid);
+    }
     return 0;
 }
 
@@ -415,6 +425,11 @@ static int copy_file_optional(const char *src, const char *dst) {
 static int copy_tree(const char *src_dir, const char *dst_dir) {
     if (should_exclude(src_dir)) return 0;
     sys_mkdir(dst_dir);
+    struct stat dir_st;
+    if (stat(src_dir, &dir_st) == 0) {
+        chmod(dst_dir, dir_st.st_mode);
+        chown(dst_dir, dir_st.st_uid, dir_st.st_gid);
+    }
     
     int chunk_size = 128;
     FAT32_FileInfo *entries = (FAT32_FileInfo *)malloc(sizeof(FAT32_FileInfo) * chunk_size);
@@ -453,6 +468,62 @@ static int copy_tree(const char *src_dir, const char *dst_dir) {
     }
     free(entries);
     return 0;
+}
+
+static void copy_skel_tree(const char *src_dir, const char *dst_dir, uid_t uid, gid_t gid) {
+    DIR *d = opendir(src_dir);
+    if (!d) return;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+
+        char s[512], dst[512];
+        snprintf(s, sizeof(s), "%s/%s", src_dir, de->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", dst_dir, de->d_name);
+
+        struct stat st;
+        if (stat(s, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            mkdir(dst, 0755);
+            chmod(dst, 0755);
+            chown(dst, uid, gid);
+            copy_skel_tree(s, dst, uid, gid);
+        } else if (S_ISREG(st.st_mode)) {
+            copy_file_optional(s, dst);
+            chmod(dst, 0644);
+            chown(dst, uid, gid);
+        }
+    }
+    closedir(d);
+}
+
+static void protect_dir_recursive(const char *dir_path) {
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+
+    chmod(dir_path, 0755);
+    chown(dir_path, 0, 0);
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            protect_dir_recursive(path);
+        } else {
+            chmod(path, 0644);
+            chown(path, 0, 0);
+        }
+    }
+    closedir(d);
 }
 
 static int s_last_percent = -1;
@@ -767,6 +838,114 @@ static void show_text_input(const char *title, const char *prompt, char *buffer,
     }
 }
 
+static void show_password_input(const char *title, const char *prompt, char *buffer, size_t max_len) {
+    int w = 64;
+    int h = 11;
+    update_term_size();
+    clear_screen_blue();
+    int last_cols = term_cols;
+    int last_rows = term_rows;
+
+    int len = 0;
+    buffer[0] = '\0';
+
+    while (1) {
+        update_term_size();
+        if (term_cols != last_cols || term_rows != last_rows) {
+            clear_screen_blue();
+            last_cols = term_cols;
+            last_rows = term_rows;
+        }
+
+        int x = (term_cols - w) / 2;
+        int y = (term_rows - h) / 2;
+
+        draw_box(x, y, w, h, title);
+        write_str(x + 4, y + 2, prompt, BG_WHITE FG_BLACK);
+
+        char masked[64];
+        int field_w = w - 8;
+        if (field_w > 52) field_w = 52;
+        int mlen = (len < 50) ? len : 50;
+        for (int i = 0; i < mlen; i++) masked[i] = '*';
+        masked[mlen] = '\0';
+
+        char field[80];
+        snprintf(field, sizeof(field), "[ %-*.*s ]", field_w - 4, field_w - 4, masked);
+        write_str(x + 4, y + 4, field, BG_BLACK FG_WHITE);
+
+        write_str(x + 4, y + 6, "Press Enter to confirm, Backspace to edit.", BG_WHITE FG_BLACK);
+        write_str(x + (w - 14) / 2, y + h - 2, "< Continue >", BG_RED FG_WHITE);
+
+        int k = get_key();
+        if (k == KEY_ENTER) {
+            if (len > 0) {
+                break;
+            }
+        } else if (k == '\b') {
+            if (len > 0) {
+                len--;
+                buffer[len] = '\0';
+            }
+        } else if (k >= 32 && k <= 126) {
+            if (len < (int)max_len - 1 && len < field_w - 6) {
+                buffer[len++] = (char)k;
+                buffer[len] = '\0';
+            }
+        }
+    }
+}
+
+static void show_user_setup_step(char *root_pass, size_t root_max,
+                                 char *username, size_t user_max,
+                                 char *user_pass, size_t pass_max) {
+    while (1) {
+        char p1[128] = {0}, p2[128] = {0};
+        show_password_input("Root Password Setup", "Enter password for the 'root' administrator account:", p1, sizeof(p1));
+        if (strlen(p1) < 4) {
+            show_message("Error", "Password too short.", "Root password must be at least 4 characters.");
+            continue;
+        }
+        show_password_input("Confirm Root Password", "Retype the 'root' password to confirm:", p2, sizeof(p2));
+        if (strcmp(p1, p2) == 0) {
+            sc_strncpy(root_pass, p1, root_max);
+            break;
+        }
+        show_message("Error", "Passwords do not match.", "Please re-enter the root password.");
+    }
+
+    while (1) {
+        show_text_input("User Account Setup", "Enter username for the primary user account:", username, user_max);
+        if (strlen(username) < 2) {
+            show_message("Error", "Username too short.", "Username must be at least 2 characters.");
+            continue;
+        }
+        if (strcmp(username, "root") == 0) {
+            show_message("Error", "Reserved username.", "Username 'root' cannot be used. Choose another name.");
+            continue;
+        }
+        break;
+    }
+
+    while (1) {
+        char p1[128] = {0}, p2[128] = {0};
+        char prompt[128];
+        snprintf(prompt, sizeof(prompt), "Enter password for user '%s':", username);
+        show_password_input("User Password Setup", prompt, p1, sizeof(p1));
+        if (strlen(p1) < 4) {
+            show_message("Error", "Password too short.", "User password must be at least 4 characters.");
+            continue;
+        }
+        snprintf(prompt, sizeof(prompt), "Retype password for user '%s':", username);
+        show_password_input("Confirm User Password", prompt, p2, sizeof(p2));
+        if (strcmp(p1, p2) == 0) {
+            sc_strncpy(user_pass, p1, pass_max);
+            break;
+        }
+        show_message("Error", "Passwords do not match.", "Please re-enter the user password.");
+    }
+}
+
 static void show_hostname_step(char *hostname, size_t max_len) {
     show_text_input("System Hostname", "Enter the system hostname for this computer:", hostname, max_len);
     if (strlen(hostname) == 0) {
@@ -1044,10 +1223,11 @@ static void show_nova_step(int *nova_enabled) {
 }
 
 static int show_confirmation(const char *diskname, int fs_choice, const char *hostname,
+                             const char *username,
                              const NetworkConfig *net_cfg, const char *timezone_str,
                              int ntp_enabled, const char *ntp_server, int nova_enabled) {
     int w = 68;
-    int h = 19;
+    int h = 20;
     int selected = 1; 
     
     update_term_size();
@@ -1077,25 +1257,28 @@ static int show_confirmation(const char *diskname, int fs_choice, const char *ho
         snprintf(line, sizeof(line), "  Hostname:     %-20s", hostname);
         write_str(x + 4, y + 5, line, BG_WHITE FG_BLACK);
 
+        snprintf(line, sizeof(line), "  Primary User: %-20s", username);
+        write_str(x + 4, y + 6, line, BG_WHITE FG_BLACK);
+
         if (net_cfg->is_dhcp) {
             snprintf(line, sizeof(line), "  Networking:   DHCP (DNS: %s)", net_cfg->nameserver);
         } else {
             snprintf(line, sizeof(line), "  Networking:   Static IP: %s (GW: %s)", net_cfg->ip, net_cfg->gateway);
         }
-        write_str(x + 4, y + 6, line, BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 7, line, BG_WHITE FG_BLACK);
 
         snprintf(line, sizeof(line), "  Timezone:     %-20s", timezone_str);
-        write_str(x + 4, y + 7, line, BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 8, line, BG_WHITE FG_BLACK);
 
         if (ntp_enabled) {
             snprintf(line, sizeof(line), "  NTP Sync:     Enabled (%s)", ntp_server);
         } else {
             snprintf(line, sizeof(line), "  NTP Sync:     Disabled");
         }
-        write_str(x + 4, y + 8, line, BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 9, line, BG_WHITE FG_BLACK);
 
         snprintf(line, sizeof(line), "  Nova Desktop: %s", nova_enabled ? "Enabled (Start on boot)" : "Disabled (Boot to CLI)");
-        write_str(x + 4, y + 9, line, BG_WHITE FG_BLACK);
+        write_str(x + 4, y + 10, line, BG_WHITE FG_BLACK);
 
         char warn[128];
         snprintf(warn, sizeof(warn), "! WARNING: ALL DATA on /dev/%s will be ERASED !", diskname);
@@ -1259,7 +1442,8 @@ static void update_rc_conf(const char *path, const char *hostname, const Network
 
 static void apply_system_configuration(const char *hostname, const NetworkConfig *net_cfg,
                                        const char *timezone_str, int ntp_enabled,
-                                       const char *ntp_server, int nova_enabled) {
+                                       const char *ntp_server, int nova_enabled,
+                                       const char *root_pass, const char *username, const char *user_pass) {
     update_rc_conf("/mnt/etc/rc.conf", hostname, net_cfg, timezone_str, ntp_enabled, ntp_server, nova_enabled);
 
     int fd_hn = sys_open("/mnt/etc/hostname", "w");
@@ -1288,6 +1472,109 @@ static void apply_system_configuration(const char *hostname, const NetworkConfig
         int len = snprintf(res_buf, sizeof(res_buf), "nameserver %s\n", net_cfg->nameserver);
         if (len > 0) sys_write_fs(fd_res, res_buf, len);
         sys_close(fd_res);
+    }
+
+    char root_salt[32], user_salt[32];
+    sha512_crypt_gensalt(root_salt, sizeof(root_salt));
+    sha512_crypt_gensalt(user_salt, sizeof(user_salt));
+    char root_hash[130], user_hash[130];
+    sha512_crypt(root_pass, root_salt, root_hash, sizeof(root_hash));
+    sha512_crypt(user_pass, user_salt, user_hash, sizeof(user_hash));
+
+    long days = (long)(time(NULL) / 86400);
+
+    int fd_pw = sys_open("/mnt/etc/passwd", "w");
+    if (fd_pw >= 0) {
+        char pw_buf[512];
+        int len = snprintf(pw_buf, sizeof(pw_buf),
+            "root:x:0:0:root:/:/bin/bsh\n"
+            "daemon:x:1:1:daemon:/usr/sbin:/bin/bsh\n"
+            "bin:x:2:2:bin:/bin:/bin/bsh\n"
+            "nobody:x:65534:65534:nobody:/:/bin/bsh\n"
+            "%s:x:1000:1000:%s:/home/%s:/bin/bsh\n",
+            username, username, username);
+        if (len > 0) sys_write_fs(fd_pw, pw_buf, len);
+        sys_close(fd_pw);
+    }
+    chmod("/mnt/etc/passwd", 0644);
+
+    int fd_sh = sys_open("/mnt/etc/shadow", "w");
+    if (fd_sh >= 0) {
+        char sh_buf[512];
+        int len = snprintf(sh_buf, sizeof(sh_buf),
+            "root:%s:%ld:0:99999:7:::\n"
+            "daemon:!:%ld:0:99999:7:::\n"
+            "bin:!:%ld:0:99999:7:::\n"
+            "nobody:!:%ld:0:99999:7:::\n"
+            "%s:%s:%ld:0:99999:7:::\n",
+            root_hash, days, days, days, days, username, user_hash, days);
+        if (len > 0) sys_write_fs(fd_sh, sh_buf, len);
+        sys_close(fd_sh);
+    }
+    chmod("/mnt/etc/shadow", 0600);
+    chown("/mnt/etc/shadow", 0, 0);
+
+    int fd_gr = sys_open("/mnt/etc/group", "w");
+    if (fd_gr >= 0) {
+        char gr_buf[512];
+        int len = snprintf(gr_buf, sizeof(gr_buf),
+            "root:x:0:\n"
+            "daemon:x:1:\n"
+            "bin:x:2:\n"
+            "tty:x:5:\n"
+            "disk:x:6:\n"
+            "wheel:x:10:root,%s\n"
+            "audio:x:29:%s\n"
+            "video:x:44:%s\n"
+            "net:x:100:%s\n"
+            "users:x:1000:\n"
+            "%s:x:1000:\n"
+            "nogroup:x:65534:\n",
+            username, username, username, username, username);
+        if (len > 0) sys_write_fs(fd_gr, gr_buf, len);
+        sys_close(fd_gr);
+    }
+    chmod("/mnt/etc/group", 0644);
+
+    int fd_doas = sys_open("/mnt/etc/doas.conf", "w");
+    if (fd_doas >= 0) {
+        const char *doas_cfg = "# /etc/doas.conf - BoredOS Privilege Elevator Configuration\npermit keepenv :wheel\n";
+        sys_write_fs(fd_doas, doas_cfg, strlen(doas_cfg));
+        sys_close(fd_doas);
+    }
+    chmod("/mnt/etc/doas.conf", 0400);
+    chown("/mnt/etc/doas.conf", 0, 0);
+
+    mkdir("/mnt/home", 0755);
+    char udir[128];
+    snprintf(udir, sizeof(udir), "/mnt/home/%s", username);
+    mkdir(udir, 0750);
+    chmod(udir, 0750);
+    chown(udir, 1000, 1000);
+
+    copy_skel_tree("/mnt/etc/skel", udir, 1000, 1000);
+
+    int fd_cfg = sys_open("/mnt/etc/.configured", "w");
+    if (fd_cfg >= 0) sys_close(fd_cfg);
+
+    int fd_ttys = sys_open("/mnt/etc/ttys", "w");
+    if (fd_ttys >= 0) {
+        const char *ttys_cfg =
+            "# name    command                 type      status       mode\n"
+            "# ---------------------------------------------------------------------\n"
+            "tty1      \"/bin/getty 1\"          ansi      on           respawn\n"
+            "tty2      \"/bin/getty 2\"          ansi      on           lazy\n"
+            "tty3      \"/bin/getty 3\"          ansi      on           lazy\n"
+            "tty4      \"/bin/getty 4\"          ansi      on           lazy\n"
+            "tty5      \"/bin/getty 5\"          ansi      off          off\n"
+            "tty6      \"/bin/getty 6\"          ansi      off          off\n"
+            "tty7      \"/bin/getty 7\"          ansi      off          off\n"
+            "tty8      \"/bin/getty 8\"          ansi      off          off\n"
+            "tty9      \"/bin/getty 9\"          ansi      off          off\n"
+            "tty10     \"/bin/getty 10\"         ansi      off          off\n"
+            "ttyS0     \"/bin/getty 11\"         vt100     off          off\n";
+        sys_write_fs(fd_ttys, ttys_cfg, strlen(ttys_cfg));
+        sys_close(fd_ttys);
     }
 }
 
@@ -1407,6 +1694,11 @@ int main(int argc, char **argv) {
     char hostname[64] = "boredos";
     show_hostname_step(hostname, sizeof(hostname));
 
+    char root_pass[128] = {0};
+    char username[64] = "user";
+    char user_pass[128] = {0};
+    show_user_setup_step(root_pass, sizeof(root_pass), username, sizeof(username), user_pass, sizeof(user_pass));
+
     NetworkConfig net_cfg = {
         .is_dhcp = 1,
         .ip = "192.168.1.50",
@@ -1426,7 +1718,7 @@ int main(int argc, char **argv) {
     int nova_enabled = 0;
     show_nova_step(&nova_enabled);
     
-    if (!show_confirmation(devname, fs_choice, hostname, &net_cfg, timezone_str, ntp_enabled, ntp_server, nova_enabled)) {
+    if (!show_confirmation(devname, fs_choice, hostname, username, &net_cfg, timezone_str, ntp_enabled, ntp_server, nova_enabled)) {
         sys_write(1, "\x1b[?25h\x1b[0m", 10);
         clear_screen();
         return 0;
@@ -1470,7 +1762,7 @@ int main(int argc, char **argv) {
     for (int j = 0; devname[j]; j++) fdisk_args[ai++] = devname[j];
     fdisk_args[ai] = 0;
 
-    int status = run_command_silent("/bin/fdisk.elf", fdisk_args, "/tmp/fdisk.log");
+    int status = run_command_silent("/bin/fdisk", fdisk_args, "/tmp/fdisk.log");
     if (status != 0) {
         show_message("Error", "fdisk failed to partition the disk.", NULL);
         sys_write(1, "\x1b[?25h\x1b[0m", 10);
@@ -1488,7 +1780,6 @@ int main(int argc, char **argv) {
     
     const char *raw_devname = devname;
     if (strncmp(raw_devname, "/dev/", 5) == 0) raw_devname += 5;
-    size_t dev_len = strlen(raw_devname);
 
     if (is_uefi) {
         snprintf(esp_dev, sizeof(esp_dev), "%s1", raw_devname);
@@ -1545,7 +1836,7 @@ int main(int argc, char **argv) {
         show_progress("Formatting EFI partition (FAT32)...", 12);
         char fat_args[64];
         snprintf(fat_args, sizeof(fat_args), "-F 32 -n EFI /dev/%s", esp_dev);
-        int mstatus = run_command_silent("/bin/mkfs_fat.elf", fat_args, "/tmp/mkfs_fat.log");
+        int mstatus = run_command_silent("/bin/mkfs_fat", fat_args, "/tmp/mkfs_fat.log");
         if (mstatus != 0) {
             int code = (mstatus >> 8) ? (mstatus >> 8) : mstatus;
             char err_detail[128];
@@ -1569,7 +1860,7 @@ int main(int argc, char **argv) {
 
     show_progress(fs_choice == 0 ? "Formatting Root partition (ext4)..." : "Formatting Root partition (FAT32)...", 18);
     char root_fs_args[64];
-    const char *mkfs_prog = (fs_choice == 0) ? "/bin/mkfs_ext4.elf" : "/bin/mkfs_fat.elf";
+    const char *mkfs_prog = (fs_choice == 0) ? "/bin/mkfs_ext4" : "/bin/mkfs_fat";
     if (fs_choice == 0) {
         snprintf(root_fs_args, sizeof(root_fs_args), "-L BOREDOS /dev/%s", root_dev);
     } else {
@@ -1646,10 +1937,15 @@ int main(int argc, char **argv) {
     copy_tree("/root", "/mnt/root");
     copy_tree("/usr", "/mnt/usr");
     copy_tree("/etc", "/mnt/etc");
-    apply_system_configuration(hostname, &net_cfg, timezone_str, ntp_enabled, ntp_server, nova_enabled);
+    apply_system_configuration(hostname, &net_cfg, timezone_str, ntp_enabled, ntp_server, nova_enabled,
+                               root_pass, username, user_pass);
     sys_mkdir("/mnt/tmp");
+    chmod("/mnt/tmp", 01777);
     sys_mkdir("/mnt/var");
     sys_mkdir("/mnt/var/run");
+    sys_mkdir("/mnt/var/log");
+    sys_mkdir("/mnt/var/tmp");
+    chmod("/mnt/var/tmp", 01777);
     sys_mkdir("/mnt/dev");
     sys_mkdir("/mnt/proc");
     sys_mkdir("/mnt/sys");
@@ -1679,7 +1975,7 @@ int main(int argc, char **argv) {
             char bpm_args[256];
             snprintf(bpm_args, sizeof(bpm_args), "--root /mnt install /usr/share/packages/%s", options[i].filename);
             
-            run_command_silent("/bin/bpm.elf", bpm_args, "/tmp/bpm.log");
+            run_command_silent("/bin/bpm", bpm_args, "/tmp/bpm.log");
             installed_count++;
         }
     }
@@ -1710,12 +2006,12 @@ int main(int argc, char **argv) {
                 "/BoredOS\n"
                 "    protocol: limine\n"
                 "    path: boot():/boredos.elf\n"
-                "    cmdline: -v root=/dev/%s init=/bin/yawn.elf\n"
+                "    cmdline: -v root=/dev/%s init=/bin/yawn\n"
                 "\n"
                 "/  └──> BoredOS (Silent)\n"
                 "    protocol: limine\n"
                 "    path: boot():/boredos.elf\n"
-                "    cmdline: root=/dev/%s init=/bin/yawn.elf\n",
+                "    cmdline: root=/dev/%s init=/bin/yawn\n",
                 root_dev, root_dev);
             if (len > 0) sys_write_fs(fd, cfg, len);
             sys_close(fd);
@@ -1743,13 +2039,13 @@ int main(int argc, char **argv) {
                 "    protocol: limine\n"
                 "    root: boot()\n"
                 "    path: /boredos.elf\n"
-                "    cmdline: -v root=/dev/%s init=/bin/yawn.elf\n"
+                "    cmdline: -v root=/dev/%s init=/bin/yawn\n"
                 "\n"
                 "/  └──> BoredOS (Silent)\n"
                 "    protocol: limine\n"
                 "    root: boot()\n"
                 "    path: /boredos.elf\n"
-                "    cmdline: root=/dev/%s init=/bin/yawn.elf\n",
+                "    cmdline: root=/dev/%s init=/bin/yawn\n",
                 root_dev, root_dev);
             if (len > 0) sys_write_fs(fd, cfg, len);
             sys_close(fd);
@@ -1779,6 +2075,71 @@ int main(int argc, char **argv) {
         sys_write_fs(fd_motd, inst_motd, strlen(inst_motd));
         sys_close(fd_motd);
     }
+
+    chmod("/mnt/etc", 0755);
+    chown("/mnt/etc", 0, 0);
+
+    DIR *d_etc = opendir("/mnt/etc");
+    if (d_etc) {
+        struct dirent *de;
+        while ((de = readdir(d_etc)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/mnt/etc/%s", de->d_name);
+            chown(path, 0, 0);
+            if (strcmp(de->d_name, "shadow") == 0) {
+                chmod(path, 0600);
+            } else if (strcmp(de->d_name, "doas.conf") == 0) {
+                chmod(path, 0400);
+            } else if (strcmp(de->d_name, "rc") == 0 || strcmp(de->d_name, "rc.shutdown") == 0 ||
+                       strcmp(de->d_name, "rc.d") == 0 || strcmp(de->d_name, "skel") == 0) {
+                chmod(path, 0755);
+            } else {
+                chmod(path, 0644);
+            }
+        }
+        closedir(d_etc);
+    }
+
+    chmod("/mnt/tmp", 01777);
+    chmod("/mnt/var/tmp", 01777);
+
+    DIR *d_rc = opendir("/mnt/etc/rc.d");
+    if (d_rc) {
+        struct dirent *de;
+        while ((de = readdir(d_rc)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/mnt/etc/rc.d/%s", de->d_name);
+            chmod(path, 0755);
+        }
+        closedir(d_rc);
+    }
+
+    DIR *d_bin = opendir("/mnt/bin");
+    if (d_bin) {
+        struct dirent *de;
+        while ((de = readdir(d_bin)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/mnt/bin/%s", de->d_name);
+            chmod(path, 0755);
+        }
+        closedir(d_bin);
+    }
+
+    protect_dir_recursive("/mnt/Library");
+    chmod("/mnt/root", 0700);
+    chown("/mnt/root", 0, 0);
+
+    chmod("/mnt/bin/login", 04755);
+    chown("/mnt/bin/login", 0, 0);
+    chmod("/mnt/bin/passwd", 04755);
+    chown("/mnt/bin/passwd", 0, 0);
+    chmod("/mnt/bin/su", 04755);
+    chown("/mnt/bin/su", 0, 0);
+    chmod("/mnt/bin/doas", 04755);
+    chown("/mnt/bin/doas", 0, 0);
     
     show_progress("Finalizing installation (syncing files)...", 98);
     if (is_uefi) {

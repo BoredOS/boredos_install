@@ -10,16 +10,20 @@ CFLAGS  = -Wall -Wextra -std=gnu11 -O2 -fno-stack-protector \
 
 LDFLAGS = -Wl,-z,max-page-size=0x1000 -Wl,-dynamic-linker,/usr/lib/ld.so -Wl,-rpath,/usr/lib:/lib
 
-APPS    = boredos_install.elf
+APPS    = boredos_install
 
 all: $(APPS)
 
-boredos_install.elf: obj/boredos_install.o
-	$(CC) $< $(LDFLAGS) -o $@
+boredos_install: obj/boredos_install.o obj/libcrypt_sha512.o
+	$(CC) $^ $(LDFLAGS) -o $@
+
+obj/libcrypt_sha512.o: ../coreutils/src/libcrypt_sha512.c
+	@mkdir -p obj
+	$(CC) $(CFLAGS) -I../coreutils/src -c $< -o $@
 
 obj/%.o: src/%.c
 	@mkdir -p obj
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I../coreutils/src -c $< -o $@
 
 install: all
 	mkdir -p $(DESTDIR)/bin

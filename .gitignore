@@ -4,3 +4,5 @@ build/
 *.a
 *.o
 .DS_Store
+boredos_install
+
